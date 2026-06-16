@@ -453,9 +453,14 @@ podman run --rm lab:4-hardened id
 
 ### `Dockerfile.5`
 
+> ⚠ **Two version-coupling traps to avoid.**
+> 1. `gcr.io/distroless/python3-debian12` ships **Python 3.11** (it's built on Debian 12 / Bookworm). The builder **must** use the same `3.11` minor — compiled wheels for `cryptography` are ABI-tied to a specific CPython.
+> 2. Distroless's `sys.path` doesn't always include `/usr/local/lib/python3.11/site-packages/`. Instead of guessing what's on `sys.path`, install with `pip --target=/pkg` (flat layout) and add `/pkg` to `PYTHONPATH` — explicit beats implicit.
+
 ```dockerfile
-# ===== Stage 1 — builder (unchanged) =====
-FROM python:3.12-slim AS builder
+# ===== Stage 1 — builder =====
+# IMPORTANT: must match runtime Python version (distroless/python3-debian12 → 3.11)
+FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
@@ -467,7 +472,9 @@ RUN apt-get update \
 
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# --target installs flat into /pkg — no Python-version-specific subdirectory.
+# Works regardless of what distroless's site-packages search path is.
+RUN pip install --no-cache-dir --target=/pkg -r requirements.txt
 
 
 # ===== Stage 2 — distroless runtime =====
@@ -476,20 +483,19 @@ FROM gcr.io/distroless/python3-debian12:nonroot AS runtime
 
 WORKDIR /app
 
-# Distroless 'nonroot' image already drops to uid 65532 — no USER directive needed,
-# but you can be explicit:
+# The 'nonroot' variant already runs as uid 65532; this line is explicit insurance.
 USER nonroot:nonroot
 
-COPY --from=builder /install /usr/local
+# Copy installed packages and make Python find them via PYTHONPATH
+COPY --from=builder /pkg /pkg
+ENV PYTHONPATH=/pkg
 
 COPY --chown=nonroot:nonroot app.py .
 
 EXPOSE 5000
 
-# Distroless has no shell → must use exec form
+# distroless/python3 sets ENTRYPOINT to /usr/bin/python3 — CMD is just the args.
 CMD ["app.py"]
-
-# Note: distroless/python3 sets ENTRYPOINT to python3, so CMD is just args.
 ```
 
 ### Build & measure

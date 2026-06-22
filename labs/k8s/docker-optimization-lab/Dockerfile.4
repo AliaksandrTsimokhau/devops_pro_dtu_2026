@@ -1,0 +1,49 @@
+# ===== Stage 1 — builder =====
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         build-essential \
+         libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+
+# ===== Stage 2 — runtime =====
+FROM python:3.12-slim AS runtime
+
+# OCI annotations — useful for registries, CVE scanners, supply-chain tooling
+LABEL org.opencontainers.image.title="docker-optimization-lab"
+LABEL org.opencontainers.image.description="Sample Flask + cryptography app, optimized image."
+LABEL org.opencontainers.image.source="https://example.invalid/repo"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Create an unprivileged user (uid:gid 10001:10001 by convention)
+RUN groupadd --system --gid 10001 app \
+    && useradd  --system --uid 10001 --gid app --no-create-home --shell /sbin/nologin app
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+COPY --chown=app:app app.py .
+
+# Drop privileges
+USER 10001:10001
+
+# Pythonic runtime hygiene
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/').status==200 else 1)"
+
+# Exec form → PID 1 is python, SIGTERM is delivered to it, graceful shutdown works
+CMD ["python", "app.py"]

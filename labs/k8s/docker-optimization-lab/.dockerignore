@@ -1,0 +1,24 @@
+# Big files
+temp-dump.log
+*.log
+*.tar
+*.zip
+
+# VCS / dev
+.git
+.gitignore
+.github/
+.vscode/
+.idea/
+
+# Local cruft
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+
+# Other Dockerfiles in this lab
+Dockerfile*
+README*

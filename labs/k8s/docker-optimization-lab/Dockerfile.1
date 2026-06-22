@@ -1,0 +1,13 @@
+# Pin a specific minor version — never use 'latest'
+FROM python:3.12.4
+
+WORKDIR /app
+
+# 1. Dependencies first — change rarely, cache-friendly
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# 2. Application code last — changes most often
+COPY app.py .
+
+CMD ["python", "app.py"]

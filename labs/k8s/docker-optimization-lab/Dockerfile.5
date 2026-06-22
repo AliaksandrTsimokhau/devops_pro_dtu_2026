@@ -1,0 +1,38 @@
+# ===== Stage 1 — builder =====
+# IMPORTANT: must match runtime Python version (distroless/python3-debian12 → 3.11)
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         build-essential \
+         libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+# --target installs flat into /pkg — no Python-version-specific subdirectory.
+# Works regardless of what distroless's site-packages search path is.
+RUN pip install --no-cache-dir --target=/pkg -r requirements.txt
+
+
+# ===== Stage 2 — distroless runtime =====
+# Distroless: only the language runtime + its deps. No shell, no apt, no curl.
+FROM gcr.io/distroless/python3-debian12:nonroot AS runtime
+
+WORKDIR /app
+
+# The 'nonroot' variant already runs as uid 65532; this line is explicit insurance.
+USER nonroot:nonroot
+
+# Copy installed packages and make Python find them via PYTHONPATH
+COPY --from=builder /pkg /pkg
+ENV PYTHONPATH=/pkg
+
+COPY --chown=nonroot:nonroot app.py .
+
+EXPOSE 5000
+
+# distroless/python3 sets ENTRYPOINT to /usr/bin/python3 — CMD is just the args.
+CMD ["app.py"]

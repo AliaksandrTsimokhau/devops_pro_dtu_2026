@@ -5,7 +5,90 @@
 **Время:** 25 минут
 **Prerequisites:** Lab 05.
 
-> ⚠️ Требуется CNI с поддержкой NetworkPolicy: **Cilium** (предпочтительно), Calico, Weave. Flannel basic — НЕ поддерживает! Проверьте: `kubectl get pods -n kube-system | grep -E 'cilium|calico|weave'`.
+> ⚠️ NetworkPolicy — это объект API, но *применяет* его CNI. Нужен CNI с
+> поддержкой NetworkPolicy: **kindnet** (современный kind, см. Шаг 0), Cilium,
+> Calico, Weave. Старый kindnet и basic Flannel — НЕ применяют (манифесты
+> создаются, но трафик не фильтруется). **Сначала пройдите Шаг 0.**
+
+---
+
+## Шаг 0. Проверка / включение CNI с поддержкой NetworkPolicy
+
+Не угадывайте по названию CNI — **проверьте enforce эмпирически**. Если CNI не
+умеет NetworkPolicy, манифесты применяются без ошибок, но правила молча
+игнорируются, и вся лаба будет «не работать» необъяснимо.
+
+### 0.1 Какой CNI установлен
+
+```bash
+kubectl get pods -n kube-system | grep -Ei 'kindnet|cilium|calico|weave|flannel'
+# kindnet-xxxxx   1/1   Running   ...
+```
+
+### 0.2 Тест: реально ли работает enforce
+
+```bash
+kubectl create ns np-check
+kubectl -n np-check run server --image=nginx:1.30 --port=80
+kubectl -n np-check run client --image=alpine --command -- sleep 3600
+kubectl -n np-check wait --for=condition=Ready pod/server pod/client --timeout=90s
+SIP=$(kubectl -n np-check get pod server -o jsonpath='{.status.podIP}')
+
+# ДО политики — должно работать
+kubectl -n np-check exec client -- wget -qO- --timeout=3 http://$SIP | grep -i title
+# <title>Welcome to nginx!</title>
+
+# включаем default-deny
+kubectl -n np-check apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: deny, namespace: np-check}
+spec: {podSelector: {}, policyTypes: [Ingress, Egress]}
+EOF
+
+# ПОСЛЕ политики — должно зависнуть/timeout
+kubectl -n np-check exec client -- wget -qO- --timeout=3 http://$SIP \
+  || echo "BLOCKED ✅ CNI enforce-ит NetworkPolicy"
+
+kubectl delete ns np-check
+```
+
+- Запрос **завис/timeout** → CNI поддерживает NetworkPolicy → переходите к Шагу 1.
+- Запрос **всё ещё проходит** → CNI игнорирует policy (старый kindnet / Flannel)
+  → см. Шаг 0.3.
+
+### 0.3 kind: CNI с поддержкой NetworkPolicy
+
+**Современный kind уже enforce-ит NetworkPolicy «из коробки» — отдельный CNI
+ставить не нужно**, Шаг 0.2 это подтвердит.
+*(Проверено: kind v0.31.0, k8s v1.35, образ `kindnetd v20251212`.)*
+
+Если у вас старый kind/kindnet или Flannel и тест 0.2 показал, что policy
+игнорируется — пересоздайте кластер с **Calico**, отключив дефолтный CNI:
+
+`kind-calico.yaml`:
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true        # выключаем kindnet
+  podSubnet: "192.168.0.0/16"    # дефолтный CIDR Calico
+```
+
+```bash
+# в этом окружении kind работает через podman:
+KIND_EXPERIMENTAL_PROVIDER=podman \
+  kind create cluster --name kind-dtu --config kind-calico.yaml
+
+# ставим Calico (проверьте актуальную версию на docs.tigera.io)
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml
+
+# ждём, пока поднимется
+kubectl -n kube-system rollout status ds/calico-node --timeout=180s
+kubectl get pods -n kube-system | grep calico
+```
+
+После установки повторите тест 0.2 — default-deny должен блокировать трафик.
 
 ---
 
@@ -44,7 +127,7 @@ spec:
     spec:
       containers:
       - name: c
-        image: nginx:1.25
+        image: nginx:1.30
         ports: [{containerPort: 80}]
 ---
 apiVersion: v1
@@ -66,7 +149,7 @@ spec:
     spec:
       containers:
       - name: c
-        image: nginx:1.25
+        image: nginx:1.30
         ports: [{containerPort: 80}]
 ---
 apiVersion: v1
@@ -97,8 +180,14 @@ kubectl exec -n zone $FRONTEND -- wget -qO- --timeout=2 db:80
 # тоже работает
 
 # Резолвится DNS
-kubectl exec -n zone $FRONTEND -- nslookup backend
+kubectl exec -n zone $FRONTEND -- getent hosts backend
+# 10.96.x.x  backend.zone.svc.cluster.local ...   (exit 0)
 ```
+
+> Используем `getent hosts`, а не `nslookup`: busybox-овский `nslookup` в alpine
+> печатает NXDOMAIN-шум по лишним search-доменам и возвращает exit 1 **даже когда
+> DNS работает**. `getent hosts` даёт чистый сигнал: строка с IP + exit 0, либо
+> пусто + ненулевой код.
 
 ---
 
@@ -123,8 +212,8 @@ kubectl apply -f deny-all.yaml
 kubectl exec -n zone $FRONTEND -- wget -qO- --timeout=2 backend:80
 # timeout
 
-kubectl exec -n zone $FRONTEND -- nslookup backend
-# тоже timeout — даже DNS не работает!
+kubectl exec -n zone $FRONTEND -- getent hosts backend
+# пусто + exit≠0 — даже DNS не работает (egress на :53 тоже заблокирован)
 ```
 
 ---
@@ -157,7 +246,8 @@ spec:
 kubectl apply -f allow-dns.yaml
 
 # Теперь DNS работает
-kubectl exec -n zone $FRONTEND -- nslookup backend
+kubectl exec -n zone $FRONTEND -- getent hosts backend
+# 10.96.x.x  backend.zone.svc.cluster.local ...   (exit 0)
 # но к самому backend всё ещё нет доступа
 kubectl exec -n zone $FRONTEND -- wget -qO- --timeout=2 backend:80
 # timeout

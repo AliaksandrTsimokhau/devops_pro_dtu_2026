@@ -5,18 +5,69 @@
 **Время:** 25 минут
 **Prerequisites:** Lab 01 (multi-node кластер — kind), Lab 06.
 
+> ⚠️ Этой лабе нужен **multi-node** кластер (≥3 worker) — тот, что вы подняли в
+> Lab 01. Шаги 2–8 на single-node не сработают.
+
+---
+
+## Шаг 0. Проверьте multi-node топологию
+
+Кластер из **Lab 01** уже multi-node (1 control-plane + 3 worker). Убедитесь:
+```bash
+kubectl get nodes
+# kind-dtu-control-plane   control-plane
+# kind-dtu-worker          <none>
+# kind-dtu-worker2         <none>
+# kind-dtu-worker3         <none>
+```
+Видите **3 worker-ноды** → переходите к Шагу 1.
+
+<details>
+<summary>Если worker-нод нет (single-node кластер) — развернуть fallback</summary>
+
+`kind` **не умеет добавлять ноды в работающий кластер** — его нужно пересоздать.
+⚠️ Это удалит ресурсы предыдущих лаб в этом кластере.
+
+`kind-multinode.yaml`:
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kind-dtu
+nodes:
+- role: control-plane
+- role: worker
+  labels: {topology.kubernetes.io/zone: zone-a}
+- role: worker
+  labels: {topology.kubernetes.io/zone: zone-b}
+- role: worker
+  labels: {topology.kubernetes.io/zone: zone-c}
+```
+```bash
+# в этом окружении kind работает через podman:
+KIND_EXPERIMENTAL_PROVIDER=podman kind delete cluster --name kind-dtu
+KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster --name kind-dtu --config kind-multinode.yaml
+kubectl wait --for=condition=Ready nodes --all --timeout=120s
+```
+</details>
+
 ---
 
 ## Шаг 1. Inspect nodes
 
 ```bash
 kubectl get nodes
-# дожно быть несколько нод (kind с config)
+# control-plane + 3 worker:
+# NAME                       ROLES           ...
+# kind-dtu-control-plane     control-plane
+# kind-dtu-worker            <none>
+# kind-dtu-worker2           <none>
+# kind-dtu-worker3           <none>
 
 kubectl get nodes --show-labels
 ```
 
-Если только одна нода — пересоздайте кластер через kind с 3 нодами (см. Lab 01 Вариант 2).
+> Важно: в kind у **control-plane стоит taint** `node-role.kubernetes.io/control-plane:NoSchedule`,
+> поэтому обычные Pod-ы едут только на 3 worker-ноды. Это пригодится в Шаге 7.
 
 ---
 
@@ -47,7 +98,7 @@ metadata:
 spec:
   containers:
   - name: app
-    image: nginx:1.25
+    image: nginx:1.30
 ```
 
 ```bash
@@ -74,7 +125,7 @@ spec:
     effect: NoSchedule
   containers:
   - name: app
-    image: nginx:1.25
+    image: nginx:1.30
 ```
 
 ```bash
@@ -110,7 +161,7 @@ spec:
     hardware: gpu        # ← ХОЧУ на ноду с этим label
   containers:
   - name: app
-    image: nginx:1.25
+    image: nginx:1.30
 ```
 
 ```bash
@@ -158,11 +209,12 @@ spec:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname    # spread по нодам
         whenUnsatisfiable: DoNotSchedule
+        nodeTaintsPolicy: Honor                # ← см. примечание ниже
         labelSelector:
           matchLabels: {app: spread}
       containers:
       - name: c
-        image: nginx:1.25
+        image: nginx:1.30
 ```
 
 ```bash
@@ -174,8 +226,18 @@ kubectl get pods -o wide -l app=spread
 Подсчитаем распределение:
 ```bash
 kubectl get pods -l app=spread -o wide --no-headers | awk '{print $7}' | sort | uniq -c
-# Должно быть примерно равномерно
+#   2 kind-dtu-worker
+#   2 kind-dtu-worker2
+#   2 kind-dtu-worker3   ← ровно 2/2/2 по трём worker-нодам
 ```
+
+> **Зачем `nodeTaintsPolicy: Honor`?** По умолчанию (`Ignore`) scheduler считает
+> доменом распределения **все** ноды по `topologyKey`, включая tainted
+> control-plane, куда Pod-ы поехать не могут. Получается домен с 0 подов, и чтобы
+> не превысить `maxSkew: 1`, на каждый worker влезает максимум 1 под → 3 пода
+> зависают в `Pending`. `Honor` исключает ноды, чьи taint-ы Pod не толерейтит
+> (control-plane), и остаются только 3 worker-ноды → честные 2/2/2.
+> (GA с Kubernetes 1.27.)
 
 ---
 
@@ -206,7 +268,7 @@ spec:
             topologyKey: kubernetes.io/hostname
       containers:
       - name: c
-        image: nginx:1.25
+        image: nginx:1.30
 ```
 
 ```bash
@@ -239,5 +301,6 @@ kubectl label node $WORKER hardware-
 - Toleration ≠ принуждение; для принуждения нужен `nodeSelector` / `nodeAffinity`
 - 3 эффекта taint: `NoSchedule` / `PreferNoSchedule` / `NoExecute`
 - **Topology Spread Constraints** — распределение Pod-ов по failure-domains (zones, hosts)
+- `nodeTaintsPolicy: Honor` — чтобы tainted control-plane не ломал расчёт skew
 - **Pod Anti-Affinity** — старая форма "не размещать рядом с такими же"
 - Use cases: GPU/Spot nodes, dedicated tenancy, HA для production app-ов

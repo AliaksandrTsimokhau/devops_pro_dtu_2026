@@ -18,7 +18,7 @@ metadata:
 spec:
   containers:
   - name: app
-    image: nginx:1.25
+    image: nginx:1.30
     securityContext:
       privileged: true                  # ← полный root
 ```
@@ -80,22 +80,28 @@ spec:
       type: RuntimeDefault
   containers:
   - name: app
-    image: nginxinc/nginx-unprivileged:1.25     # ← образ запускается non-root
+    image: nginxinc/nginx-unprivileged:1.30     # ← образ запускается non-root
     securityContext:
       allowPrivilegeEscalation: false
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
+    # readOnlyRootFilesystem=true → root ФС только для чтения.
+    # nginx пишет во временные файлы, поэтому каждый writable путь
+    # отдаём как emptyDir, иначе Pod упадёт с "Read-only file system".
     volumeMounts:
-    # nginx нужен writable cache dir
     - name: cache
-      mountPath: /var/cache/nginx
+      mountPath: /var/cache/nginx       # кэш и client/proxy temp
     - name: run
-      mountPath: /var/run
+      mountPath: /var/run               # pid-файл
+    - name: tmp
+      mountPath: /tmp                    # nginx temp (/tmp/proxy_temp и т.д.)
   volumes:
   - name: cache
     emptyDir: {}
   - name: run
+    emptyDir: {}
+  - name: tmp
     emptyDir: {}
 ```
 
@@ -111,7 +117,7 @@ kubectl get pod -n secure hardened
 
 ```bash
 kubectl exec -n secure hardened -- id
-# uid=10001 gid=10001 ✅ non-root
+# uid=10001 gid=10001 groups=10001 ✅ non-root
 
 kubectl exec -n secure hardened -- cat /proc/self/status | grep -E 'Uid|CapEff'
 # Uid: 10001 10001 10001 10001
@@ -127,11 +133,28 @@ kubectl exec -n secure hardened -- touch /test.txt 2>&1
 
 В managed-кластерах (EKS/GKE) audit события идут в CloudWatch / Stackdriver. В локальном setup-е audit log должен быть отдельно настроен.
 
-Можете посмотреть deprecated warnings:
+Зато `warn=restricted` показывает warning прямо в терминале. Важно: для этого
+нужен Pod, который **проходит** `enforce=baseline`, но **нарушает** `restricted`.
+Привилегированный `bad-pod` тут не подойдёт — его отклонит сам `enforce=baseline`
+(см. Шаг 3), warning вы не увидите.
+
+Возьмём обычный nginx без securityContext — baseline ОК, но restricted нарушен:
 ```bash
-# при apply Pod-а который нарушает restricted policy
-kubectl apply -n secure -f bad-pod.yaml 2>&1
-# Warning: would violate PodSecurity "restricted:latest"
+cat <<EOF | kubectl apply -n secure -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: baseline-ok
+spec:
+  containers:
+  - name: app
+    image: nginx:1.30
+EOF
+# Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false,
+#   unrestricted capabilities, runAsNonRoot != true, seccompProfile ...
+# pod/baseline-ok created      ← Pod ВСЁ РАВНО создан: warn только предупреждает
+
+kubectl delete -n secure pod baseline-ok
 ```
 
 ---

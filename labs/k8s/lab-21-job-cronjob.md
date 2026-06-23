@@ -21,7 +21,7 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: hello
-        image: busybox
+        image: busybox:1.37
         command: ["sh", "-c", "echo Hello from Job; date; sleep 5; echo Done"]
   backoffLimit: 3
   ttlSecondsAfterFinished: 300            # автоудаление через 5 мин
@@ -58,7 +58,7 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: worker
-        image: busybox
+        image: busybox:1.37
         command: ["sh", "-c", "echo Processing item $HOSTNAME; sleep $((RANDOM % 5 + 2)); echo Done"]
 ```
 
@@ -92,7 +92,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: worker
-        image: busybox
+        image: busybox:1.37
         command:
         - sh
         - -c
@@ -137,7 +137,7 @@ spec:
           restartPolicy: OnFailure
           containers:
           - name: hello
-            image: busybox
+            image: busybox:1.37
             command: ["sh", "-c", "echo Hello at $(date)"]
 ```
 
@@ -145,16 +145,28 @@ spec:
 kubectl apply -f cronjob.yaml
 kubectl get cronjobs
 
-# Подождём 2-3 минуты
-sleep 120
+# Подождём 1-2 минуты (schedule = каждую минуту)
+sleep 90
 
-# Появятся Jobs
-kubectl get jobs -l cronjob.kubernetes.io/name=hello-cron
+# Появятся Job-ы с именем-префиксом <cronjob>-<timestamp>.
+# ВАЖНО: Job-ы от CronJob НЕ имеют лейбла cronjob.kubernetes.io/name —
+# фильтруем по ownerReference на CronJob:
+kubectl get jobs -o jsonpath='{range .items[?(@.metadata.ownerReferences[0].name=="hello-cron")]}{.metadata.name}{"\n"}{end}'
+# hello-cron-29702196
+# hello-cron-29702197
 
-# Логи последнего
-LATEST_POD=$(kubectl get pods -l cronjob.kubernetes.io/name=hello-cron --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
-kubectl logs $LATEST_POD
+# Логи последнего запуска (берём самый свежий Job и читаем его логи):
+LATEST_JOB=$(kubectl get jobs \
+  -o jsonpath='{range .items[?(@.metadata.ownerReferences[0].name=="hello-cron")]}{.metadata.name}{"\n"}{end}' \
+  | tail -1)
+kubectl logs job/$LATEST_JOB
+# Hello at Mon Jun 22 12:39:00 UTC 2026
 ```
+
+> ⚠️ Частая ошибка: `kubectl get jobs -l cronjob.kubernetes.io/name=hello-cron`
+> вернёт **No resources found** — такого лейбла на Job-ах нет. Связь
+> CronJob → Job хранится в `ownerReferences`, а не в лейблах. Фильтруем по owner
+> (как выше) либо проще — по имени-префиксу: `kubectl get jobs | grep hello-cron`.
 
 ---
 
@@ -177,30 +189,36 @@ spec:
 
 ## Шаг 6. activeDeadlineSeconds — таймаут
 
-```yaml
+```bash
+kubectl apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata: {name: timeout-job}
 spec:
   activeDeadlineSeconds: 30       # если не завершился за 30 сек — fail
-  backoffLimit: 0                  # без повторов
+  backoffLimit: 0                 # без повторов
   template:
     spec:
       restartPolicy: Never
       containers:
       - name: long
-        image: busybox
+        image: busybox:1.37
         command: ["sh", "-c", "sleep 60"]    # 60 сек — будет терминирован
+EOF
+
+# ждём перехода в Failed (≈60-70 сек: deadline 30с + терминирование пода)
+kubectl wait --for=condition=failed job/timeout-job --timeout=90s
+kubectl get jobs timeout-job
+# NAME          STATUS   COMPLETIONS   ...
+# timeout-job   Failed   0/1
+kubectl get job timeout-job -o jsonpath='{.status.conditions[?(@.type=="Failed")].reason}'; echo
+# DeadlineExceeded
 ```
 
-```bash
-kubectl apply -f - <<EOF
-$(cat above)
-EOF
-sleep 35
-kubectl get jobs timeout-job
-# COMPLETIONS: 0/1, STATUS: Failed
-```
+> Не используйте `sleep 35` — на 35-й секунде Job ещё в промежуточном состоянии
+> (`FailureTarget`), и `kubectl get` покажет не `Failed`. Дождитесь условия через
+> `kubectl wait` (как выше): deadline срабатывает на 30с, но финальный переход в
+> `Failed` занимает суммарно ~60-70 секунд.
 
 ---
 
@@ -254,6 +272,7 @@ kubectl delete -f cronjob.yaml
 kubectl delete -f indexed-job.yaml
 kubectl delete -f parallel-job.yaml
 kubectl delete -f job.yaml
+kubectl delete job timeout-job --ignore-not-found    # из Шага 6 (создавался inline)
 ```
 
 ---

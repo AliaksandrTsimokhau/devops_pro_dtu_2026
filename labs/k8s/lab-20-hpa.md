@@ -16,8 +16,15 @@ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/late
 kubectl patch -n kube-system deployment metrics-server --type=json \
   -p '[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
 
-kubectl wait -n kube-system --for=condition=ready pod -l k8s-app=metrics-server --timeout=120s
+# ждём именно завершения rollout, а не отдельных Pod-ов:
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s
 ```
+
+> ⚠️ Не используйте `kubectl wait -l k8s-app=metrics-server` сразу после `patch`:
+> селектор поймает **и** новый Pod, **и** старый (до патча), который ещё
+> терминируется в процессе rollout, и команда упадёт с `error: timed out
+> waiting for the condition` — хотя metrics-server на самом деле поднялся.
+> `rollout status` ждёт корректно.
 
 Проверка:
 ```bash
@@ -99,8 +106,12 @@ spec:
 ```bash
 kubectl apply -f hpa.yaml
 kubectl get hpa
-# TARGETS: <unknown>/50% → через минуту: 0%/50%
+# TARGETS: <unknown>/50% → через 30–60 сек: 0%/50%
 ```
+
+> `<unknown>` в первые ~минуту — это норма: metrics-server ещё не собрал первый
+> сэмпл CPU. Если `<unknown>` держится дольше 2 минут — проверьте Шаг 1
+> (`kubectl top pods` должен отдавать данные).
 
 ---
 
@@ -108,7 +119,7 @@ kubectl get hpa
 
 В отдельном терминале:
 ```bash
-kubectl run -it --rm load-generator --image=busybox -- /bin/sh -c \
+kubectl run -it --rm load-generator --image=busybox:1.37 -- /bin/sh -c \
   "while true; do wget -q -O- http://cpu-burner.default.svc.cluster.local; done"
 ```
 
@@ -117,7 +128,13 @@ kubectl run -it --rm load-generator --image=busybox -- /bin/sh -c \
 watch kubectl get hpa,pods -l app=cpu-burner
 ```
 
-Через 1–2 минуты HPA увеличит количество реплик. Через 5–10 минут (после остановки нагрузки) — уменьшит обратно.
+Через 1–2 минуты HPA увеличит количество реплик (CPU подскочит до ~200%/50% →
+4+ Pod-а). Остановите нагрузку (`Ctrl+C` в окне load-generator).
+
+> Scale **down** не моментальный: по умолчанию HPA выжидает
+> `stabilizationWindowSeconds: 300` (5 минут) после падения нагрузки, прежде чем
+> уменьшать реплики — защита от flapping. Это нормально, не баг. Управляется
+> через `behavior` (Шаг 7).
 
 ---
 
